@@ -1,0 +1,9 @@
+requests>=2.31
+faster-whisper>=1.1
+numpy>=1.26
+sounddevice>=0.5
+soundfile>=0.12
+Pillow>=10.0
+edge-tts>=7.0
+pygame>=2.6
+pyttsx3>=2.98
