@@ -33,7 +33,7 @@ LOCAL_LLM_BASE_URL = os.getenv(
 ).rstrip("/")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip()
 
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "base.en")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
@@ -47,28 +47,63 @@ HISTORY_MESSAGES = int(os.getenv("HISTORY_MESSAGES", "6"))
 SAMPLE_RATE = 16_000
 
 
-SYSTEM_PROMPT = """You are Mila, a warm English conversation teacher.
+LANGUAGE_OPTIONS = {
+    "English": {
+        "code": "en",
+        "name": "English",
+        "instruction": "Speak naturally in English.",
+        "translation_name": "Simplified Chinese",
+        "translation_label": "中文",
+        "voice_keywords": ["zira", "jenny", "aria", "hazel", "female"],
+    },
+    "日本語": {
+        "code": "ja",
+        "name": "Japanese",
+        "instruction": "Speak naturally in Japanese.",
+        "translation_name": "Simplified Chinese",
+        "translation_label": "中文",
+        "voice_keywords": ["haruka", "ayumi", "nanami", "female"],
+    },
+    "中文": {
+        "code": "zh",
+        "name": "Simplified Chinese",
+        "instruction": "Speak naturally in Simplified Chinese.",
+        "translation_name": "English",
+        "translation_label": "English",
+        "voice_keywords": ["huihui", "xiaoxiao", "yaoyao", "female"],
+    },
+}
 
-Your job is fast spoken English conversation practice.
+
+def build_system_prompt(language_key: str) -> str:
+    info = LANGUAGE_OPTIONS.get(language_key, LANGUAGE_OPTIONS["English"])
+    language_name = info["name"]
+    instruction = info["instruction"]
+    translation_name = info["translation_name"]
+
+    return f"""You are Mila, a warm and concise conversation teacher.
+
+The selected conversation language is: {language_name}.
+The subtitle translation language is: {translation_name}.
 
 Rules:
-1. Reply immediately. Do not reason step by step.
-2. Keep reply_en VERY short: normally 1 or 2 short sentences.
-3. Ask at most one simple follow-up question.
-4. If the learner makes an important English mistake, give only one very brief correction.
-5. reply_en must come FIRST because it will be spoken aloud immediately.
-6. Keep all three XML fields concise.
+1. {instruction}
+2. Use the selected conversation language for your main reply.
+3. Keep replies short: normally 1 or 2 sentences.
+4. Ask at most one natural follow-up question.
+5. Do not reason step by step.
+6. Do not output chain-of-thought.
+7. If the learner makes an important mistake, correct it very briefly.
+8. reply must come first because it will be spoken aloud.
+9. Translate both the learner's latest message and your reply into {translation_name} for subtitles.
+10. Keep subtitle translations short and faithful.
 
 Return exactly these three XML elements and no markdown:
-<reply_en>Your short natural English reply.</reply_en>
-<user_zh>简短翻译用户刚才说的英语。</user_zh>
-<reply_zh>简短翻译 reply_en。</reply_zh>
-
-Do not put Chinese inside reply_en.
-Do not output analysis, reasoning, or thinking.
+<reply>Your reply in the selected conversation language.</reply>
+<user_translation>Translation of the learner's latest message into {translation_name}.</user_translation>
+<reply_translation>Translation of reply into {translation_name}.</reply_translation>
 
 /no_think"""
-
 
 def log_timing(label: str, started_at: float) -> float:
     """Print elapsed time for latency diagnosis and return current timestamp."""
@@ -311,14 +346,22 @@ class LocalLLM:
 
             response.raise_for_status()
 
-            for raw in response.iter_lines(decode_unicode=True):
+            # IMPORTANT:
+            # LM Studio streams UTF-8 bytes. requests may otherwise guess
+            # ISO-8859-1 when the response has no explicit charset, which
+            # turns Chinese/Japanese text into mojibake such as
+            # "ä½ å¥½" instead of "你好".
+            for raw in response.iter_lines(decode_unicode=False):
                 if stop_event.is_set():
                     return
 
                 if not raw:
                     continue
 
-                line = raw.strip()
+                if isinstance(raw, bytes):
+                    line = raw.decode("utf-8", errors="replace").strip()
+                else:
+                    line = str(raw).strip()
 
                 if line.startswith("data:"):
                     line = line[5:].strip()
@@ -431,9 +474,12 @@ class VoiceTutorApp:
 
         self.stop_event = threading.Event()
         self.busy = False
+        self.language_var = tk.StringVar(value="English")
 
         self.tts_queue: queue.Queue[str | None] = queue.Queue()
         self.tts_worker_event: threading.Event | None = None
+        self.current_tts_language = "English"
+        self.current_translation_label = "中文"
 
         self._build_ui()
 
@@ -568,6 +614,25 @@ class VoiceTutorApp:
 
         self.transcript.configure(state="disabled")
 
+        language_bar = ttk.Frame(outer)
+        language_bar.pack(fill="x", pady=(4, 6))
+
+        ttk.Label(
+            language_bar,
+            text="对话语言：",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side="left")
+
+        self.language_combo = ttk.Combobox(
+            language_bar,
+            textvariable=self.language_var,
+            values=list(LANGUAGE_OPTIONS.keys()),
+            state="readonly",
+            width=12,
+        )
+        self.language_combo.pack(side="left", padx=(6, 0))
+        self.language_combo.set("English")
+
         controls = ttk.Frame(outer)
         controls.pack(
             fill="x",
@@ -576,7 +641,7 @@ class VoiceTutorApp:
 
         self.talk_button = ttk.Button(
             controls,
-            text="🎙 开始说英语（空格键）",
+            text="🎙 开始说（空格键）",
             style="Talk.TButton",
             command=self.toggle_recording,
         )
@@ -684,7 +749,7 @@ class VoiceTutorApp:
             )
 
             self.status_var.set(
-                "正在听你说英语……说完后再按一次空格键。"
+                "正在听你说话……说完后再按一次空格键。"
             )
 
         except Exception as exc:
@@ -699,7 +764,7 @@ class VoiceTutorApp:
 
         except Exception as exc:
             self.talk_button.configure(
-                text="🎙 开始说英语（空格键）"
+                text="🎙 开始说（空格键）"
             )
 
             messagebox.showerror(
@@ -709,7 +774,7 @@ class VoiceTutorApp:
             return
 
         self.talk_button.configure(
-            text="🎙 开始说英语（空格键）"
+            text="🎙 开始说（空格键）"
         )
 
         if not audio_path:
@@ -719,6 +784,11 @@ class VoiceTutorApp:
             return
 
         self.busy = True
+        self.current_tts_language = self.language_var.get()
+        self.current_translation_label = LANGUAGE_OPTIONS.get(
+            self.current_tts_language,
+            LANGUAGE_OPTIONS["English"],
+        )["translation_label"]
         self.stop_event = threading.Event()
         self.tts_queue = queue.Queue()
         self.tts_worker_event = None
@@ -727,15 +797,18 @@ class VoiceTutorApp:
             "正在识别你的英语……"
         )
 
+        selected_language = self.language_var.get()
+
         threading.Thread(
             target=self._conversation_worker,
-            args=(audio_path,),
+            args=(audio_path, selected_language),
             daemon=True,
         ).start()
 
     def _conversation_worker(
         self,
         audio_path: Path,
+        selected_language: str,
     ) -> None:
 
         turn_start = time.perf_counter()
@@ -748,19 +821,42 @@ class VoiceTutorApp:
 
             stt_start = time.perf_counter()
 
+            language_info = LANGUAGE_OPTIONS.get(
+                selected_language,
+                LANGUAGE_OPTIONS["English"],
+            )
+            whisper_language = language_info["code"]
+
+            initial_prompt = None
+            if whisper_language == "zh":
+                initial_prompt = (
+                    "这是普通话中文对话。请准确识别简体中文口语，"
+                    "保留常见中文词语和自然句子。"
+                )
+            elif whisper_language == "ja":
+                initial_prompt = (
+                    "これは自然な日本語の会話です。"
+                    "日本語の発話を正確に文字起こししてください。"
+                )
+            elif whisper_language == "en":
+                initial_prompt = (
+                    "This is a natural English conversation."
+                )
+
             segments, _ = self.whisper.transcribe(
                 str(audio_path),
-                language="en",
-                beam_size=1,
-                best_of=1,
+                language=whisper_language,
+                beam_size=2 if whisper_language in ("zh", "ja") else 1,
+                best_of=2 if whisper_language in ("zh", "ja") else 1,
                 temperature=0.0,
                 vad_filter=True,
                 vad_parameters={
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 100,
+                    "min_silence_duration_ms": 250,
+                    "speech_pad_ms": 150,
                 },
                 without_timestamps=True,
                 condition_on_previous_text=False,
+                initial_prompt=initial_prompt,
             )
 
             user_en = " ".join(
@@ -775,7 +871,7 @@ class VoiceTutorApp:
             )
 
             print(
-                f"[STT] {user_en}",
+                f"[STT:{selected_language}] {user_en}",
                 flush=True,
             )
 
@@ -787,13 +883,14 @@ class VoiceTutorApp:
             self.events.call(
                 self._start_turn_display,
                 user_en,
+                selected_language,
             )
 
             # 只保留最近几条消息，减少 Prompt processing 时间。
             messages = [
                 {
                     "role": "system",
-                    "content": SYSTEM_PROMPT,
+                    "content": build_system_prompt(selected_language),
                 },
                 *self.history[-HISTORY_MESSAGES:],
                 {
@@ -815,25 +912,25 @@ class VoiceTutorApp:
 
                 reply_en = tag_value(
                     raw,
-                    "reply_en",
+                    "reply",
                 )
 
-                user_zh = tag_value(
+                user_translation = tag_value(
                     raw,
-                    "user_zh",
+                    "user_translation",
                 )
 
-                reply_zh = tag_value(
+                reply_translation = tag_value(
                     raw,
-                    "reply_zh",
+                    "reply_translation",
                 )
 
                 self.events.call(
                     self._update_turn_display,
                     user_en,
-                    user_zh,
+                    user_translation,
                     reply_en,
-                    reply_zh,
+                    reply_translation,
                 )
 
                 # pyttsx3 on Windows can be unreliable when many short
@@ -852,19 +949,19 @@ class VoiceTutorApp:
 
             reply_en = tag_value(
                 raw,
-                "reply_en",
+                "reply",
                 allow_partial=False,
             )
 
-            user_zh = tag_value(
+            user_translation = tag_value(
                 raw,
-                "user_zh",
+                "user_translation",
                 allow_partial=False,
             )
 
-            reply_zh = tag_value(
+            reply_translation = tag_value(
                 raw,
-                "reply_zh",
+                "reply_translation",
                 allow_partial=False,
             )
 
@@ -916,9 +1013,9 @@ class VoiceTutorApp:
             self.events.call(
                 self._update_turn_display,
                 user_en,
-                user_zh,
+                user_translation,
                 reply_en,
-                reply_zh,
+                reply_translation,
             )
 
             print(
@@ -1002,16 +1099,13 @@ class VoiceTutorApp:
                 engine.setProperty("rate", 155)
                 engine.setProperty("volume", 1.0)
 
-                # Prefer an English female voice on Windows.
+                # Prefer a female voice matching the selected language.
                 voices = engine.getProperty("voices")
-                preferred_keywords = [
-                    "zira",
-                    "female",
-                    "jenny",
-                    "aria",
-                    "susan",
-                    "hazel",
-                ]
+                language_info = LANGUAGE_OPTIONS.get(
+                    self.current_tts_language,
+                    LANGUAGE_OPTIONS["English"],
+                )
+                preferred_keywords = language_info["voice_keywords"]
 
                 selected_voice = None
 
@@ -1027,7 +1121,7 @@ class VoiceTutorApp:
                 if selected_voice:
                     engine.setProperty("voice", selected_voice.id)
                     print(
-                        f"[TTS] Selected female voice: {selected_voice.name}",
+                        f"[TTS] Selected voice ({self.current_tts_language}): {selected_voice.name}",
                         flush=True,
                     )
                 elif voices:
@@ -1137,11 +1231,17 @@ class VoiceTutorApp:
     def _start_turn_display(
         self,
         user_en: str,
+        selected_language: str,
     ) -> None:
 
         self.status_var.set(
             "本地模型正在回答……"
         )
+
+        translation_label = LANGUAGE_OPTIONS.get(
+            selected_language,
+            LANGUAGE_OPTIONS["English"],
+        )["translation_label"]
 
         self._append(
             "\nYou\n",
@@ -1154,7 +1254,7 @@ class VoiceTutorApp:
         )
 
         self._append(
-            "中文：翻译中……\n",
+            f"{translation_label}：翻译中……\n",
             "chinese",
         )
 
@@ -1171,9 +1271,9 @@ class VoiceTutorApp:
     def _update_turn_display(
         self,
         user_en: str,
-        user_zh: str,
+        user_translation: str,
         reply_en: str,
-        reply_zh: str,
+        reply_translation: str,
     ) -> None:
 
         self.transcript.configure(
@@ -1199,8 +1299,8 @@ class VoiceTutorApp:
 
         self.transcript.insert(
             "end",
-            "中文："
-            + (user_zh or "翻译中……")
+            f"{self.current_translation_label}："
+            + (user_translation or "翻译中……")
             + "\n\n",
             "chinese",
         )
@@ -1219,8 +1319,8 @@ class VoiceTutorApp:
 
         self.transcript.insert(
             "end",
-            "中文："
-            + (reply_zh or "翻译中……")
+            f"{self.current_translation_label}："
+            + (reply_translation or "翻译中……")
             + "\n",
             "chinese",
         )
