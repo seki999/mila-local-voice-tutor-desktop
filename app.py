@@ -901,6 +901,7 @@ class VoiceTutorApp:
 
             raw = ""
             spoken_chars = 0
+            reply_spoken = False
 
             llm_start = time.perf_counter()
 
@@ -933,10 +934,24 @@ class VoiceTutorApp:
                     reply_translation,
                 )
 
-                # pyttsx3 on Windows can be unreliable when many short
-                # utterances are queued while the LLM is still streaming.
-                # Keep updating the subtitles here, but speak the complete
-                # English reply once after generation finishes.
+                # Start speaking as soon as the MAIN reply XML element is
+                # complete. Do NOT wait for subtitle translations to finish.
+                # We still send the whole reply as one pyttsx3 utterance, which
+                # avoids the old "only the first sentence is spoken" problem.
+                if not reply_spoken:
+                    complete_reply = tag_value(
+                        raw,
+                        "reply",
+                        allow_partial=False,
+                    )
+                    if complete_reply:
+                        reply_spoken = True
+                        print(
+                            f"[TTS] Main reply complete; speaking before translations: "
+                            f"{complete_reply}",
+                            flush=True,
+                        )
+                        self._enqueue_tts(complete_reply.strip())
 
             print(
                 f"[TIMING] LLM total: "
@@ -981,12 +996,12 @@ class VoiceTutorApp:
                     cleaned,
                 ).strip()
 
-            # Speak the whole English reply as ONE utterance.
-            # This avoids the Windows pyttsx3 issue where only the first
-            # queued sentence may be played.
-            if reply_en.strip():
+            # Fallback: if the model did not close <reply> until the very end,
+            # or did not follow XML perfectly, speak the final cleaned reply now.
+            if reply_en.strip() and not reply_spoken:
+                reply_spoken = True
                 print(
-                    f"[TTS] Speaking full reply: {reply_en}",
+                    f"[TTS] Speaking final reply fallback: {reply_en}",
                     flush=True,
                 )
                 self._enqueue_tts(reply_en.strip())
